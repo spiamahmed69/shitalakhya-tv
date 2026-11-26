@@ -74,7 +74,7 @@ const MIN_CALL_GAP_MS = 6000
 let lastCallStart = 0
 
 // Gemini ফ্রি টিয়ার মডেল (Flash-Lite-এ দিনে প্রায় ৫০০টা ফ্রি call)।
-const GEMINI_MODEL = 'gemini-2.5-flash-lite'
+const GEMINI_MODEL = 'gemini-3.5-flash-lite'
 
 async function rewriteWithGemini(item, sourceName) {
   // 429 (রেট লিমিট) এলে অপেক্ষা করে আবার চেষ্টা করা হবে।
