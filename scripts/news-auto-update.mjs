@@ -1,10 +1,10 @@
 // শীতলক্ষ্যা টিভি — অটো নিউজ আপডেটার
 // প্রতি ঘণ্টায় GitHub Actions থেকে চলে। RSS ফিড থেকে নতুন খবর নিয়ে
-// DeepSeek দিয়ে নিজের ভাষায় নতুন করে লিখে Firestore-এ সরাসরি প্রকাশ করে।
+// Gemini (ফ্রি টিয়ার) দিয়ে নিজের ভাষায় নতুন করে লিখে Firestore-এ সরাসরি প্রকাশ করে।
 // নিয়ম: প্রতিটি খবরে আলাদা API call; মিনিটে সর্বোচ্চ ১০ call;
 // 429 (রেট লিমিট) এলে অপেক্ষা করে আবার চেষ্টা; লেখার দৈর্ঘ্য সীমিত।
 // কোনো খবর হুবহু কপি করা হয় না; প্রতিটি খবরে মূল সূত্রের নাম ও লিংক থাকে।
-// চালাতে env লাগে: DEEPSEEK_API_KEY, FIREBASE_SERVICE_ACCOUNT (JSON string)
+// চালাতে env লাগে: GEMINI_API_KEY, FIREBASE_SERVICE_ACCOUNT (JSON string)
 
 import admin from 'firebase-admin'
 import crypto from 'node:crypto'
@@ -73,34 +73,30 @@ function slugify(title, link) {
 const MIN_CALL_GAP_MS = 6000
 let lastCallStart = 0
 
-async function rewriteWithDeepSeek(item, sourceName) {
+// Gemini ফ্রি টিয়ার মডেল (Flash-Lite-এ দিনে প্রায় ৫০০টা ফ্রি call)।
+const GEMINI_MODEL = 'gemini-2.5-flash-lite'
+
+async function rewriteWithGemini(item, sourceName) {
   // 429 (রেট লিমিট) এলে অপেক্ষা করে আবার চেষ্টা করা হবে।
   const retryWaits = [30000, 60000]
+  const prompt = `তুমি একজন বাংলা সংবাদ লেখক। নিচের খবরের তথ্য থেকে নিজের ভাষায় সম্পূর্ণ নতুন করে বাংলা খবর লিখবে। মূল খবরের বাক্য হুবহু কপি করবে না। নাম, সংখ্যা, তারিখ ও তথ্য ঠিক রাখবে; কোনো তথ্য বানাবে না। শুধু JSON দেবে।\n\nউৎস: ${sourceName}\nমূল শিরোনাম: ${item.title}\nমূল লিংক: ${item.link}\nবিবরণ: ${item.desc.slice(0, 3000)}\n\nএই JSON আকারে লেখো: {"title": "সংক্ষিপ্ত শিরোনাম", "summary": "১-২ বাক্যের সংক্ষেপ", "body": ["অনুচ্ছেদ ১", "অনুচ্ছেদ ২", "অনুচ্ছেদ ৩"], "category": "এই ৯টির একটি: jatiyo, rajniti, khela, binodon, antorjatik, orthoniti, shikkha, dhormo, projukti", "breaking": true/false (শুধু খুব গুরুত্বপূর্ণ জরুরি খবর হলে true)}। body-তে ৩-৪টি ছোট অনুচ্ছেদ থাকবে।`
   for (let attempt = 0; ; attempt++) {
     const gap = Date.now() - lastCallStart
     if (gap < MIN_CALL_GAP_MS) await sleep(MIN_CALL_GAP_MS - gap)
     lastCallStart = Date.now()
-    const res = await fetch('https://api.deepseek.com/chat/completions', {
+    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}`,
+        'x-goog-api-key': process.env.GEMINI_API_KEY,
       },
       body: JSON.stringify({
-        model: 'deepseek-chat',
-        temperature: 0.3,
-        max_tokens: 1200,
-        response_format: { type: 'json_object' },
-        messages: [
-          {
-            role: 'system',
-            content: 'তুমি একজন বাংলা সংবাদ লেখক। দেওয়া খবরের তথ্য থেকে নিজের ভাষায় সম্পূর্ণ নতুন করে বাংলা খবর লিখবে। মূল খবরের বাক্য হুবহু কপি করবে না। নাম, সংখ্যা, তারিখ ও তথ্য ঠিক রাখবে; কোনো তথ্য বানাবে না। শুধু JSON দেবে।',
-          },
-          {
-            role: 'user',
-            content: `উৎস: ${sourceName}\nমূল শিরোনাম: ${item.title}\nমূল লিংক: ${item.link}\nবিবরণ: ${item.desc.slice(0, 3000)}\n\nএই JSON আকারে লেখো: {"title": "সংক্ষিপ্ত শিরোনাম", "summary": "১-২ বাক্যের সংক্ষেপ", "body": ["অনুচ্ছেদ ১", "অনুচ্ছেদ ২", "অনুচ্ছেদ ৩"], "category": "এই ৯টির একটি: jatiyo, rajniti, khela, binodon, antorjatik, orthoniti, shikkha, dhormo, projukti", "breaking": true/false (শুধু খুব গুরুত্বপূর্ণ জরুরি খবর হলে true)}। body-তে ৩-৪টি ছোট অনুচ্ছেদ থাকবে।`,
-          },
-        ],
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: {
+          temperature: 0.3,
+          maxOutputTokens: 1200,
+          responseMimeType: 'application/json',
+        },
       }),
     })
     if (res.status === 429 && attempt < retryWaits.length) {
@@ -109,11 +105,14 @@ async function rewriteWithDeepSeek(item, sourceName) {
       await sleep(wait)
       continue
     }
-    if (!res.ok) throw new Error(`DeepSeek ${res.status}: ${(await res.text()).slice(0, 200)}`)
+    if (!res.ok) throw new Error(`Gemini ${res.status}: ${(await res.text()).slice(0, 200)}`)
     const data = await res.json()
-    const out = JSON.parse(data.choices[0].message.content)
+    const text = data?.candidates?.[0]?.content?.parts?.map((p) => p.text || '').join('') || ''
+    if (!text) throw new Error('Gemini থেকে খালি উত্তর এসেছে')
+    const clean = text.replace(/```json/gi, '').replace(/```/g, '').trim()
+    const out = JSON.parse(clean)
     if (!out.title || !out.summary || !Array.isArray(out.body) || !out.body.length) {
-      throw new Error('DeepSeek থেকে অসম্পূর্ণ লেখা এসেছে')
+      throw new Error('Gemini থেকে অসম্পূর্ণ লেখা এসেছে')
     }
     if (!CATEGORIES.includes(out.category)) out.category = 'jatiyo'
     // দৈর্ঘ্য সীমিত রাখা: শিরোনাম ১২০, সংক্ষেপ ২৫০, body সর্বোচ্চ ৪ অনুচ্ছেদ × ৬০০ অক্ষর।
@@ -127,7 +126,7 @@ async function rewriteWithDeepSeek(item, sourceName) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
 async function main() {
-  if (!process.env.DEEPSEEK_API_KEY) throw new Error('DEEPSEEK_API_KEY env নেই')
+  if (!process.env.GEMINI_API_KEY) throw new Error('GEMINI_API_KEY env নেই')
   if (!process.env.FIREBASE_SERVICE_ACCOUNT) throw new Error('FIREBASE_SERVICE_ACCOUNT env নেই')
   admin.initializeApp({ credential: admin.credential.cert(JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)) })
   const db = admin.firestore()
@@ -179,7 +178,7 @@ async function main() {
   for (const item of selected) {
     const feed = item.feed
     try {
-      const rw = await rewriteWithDeepSeek(item, feed.name)
+      const rw = await rewriteWithGemini(item, feed.name)
       const slug = slugify(rw.title, item.link)
       const body = [...rw.body, `সূত্র: ${feed.name} — ${item.link}`]
       await db.collection('articles').doc(slug).set({
