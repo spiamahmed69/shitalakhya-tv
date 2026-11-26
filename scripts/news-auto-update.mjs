@@ -1,6 +1,8 @@
 // শীতলক্ষ্যা টিভি — অটো নিউজ আপডেটার
 // প্রতি ঘণ্টায় GitHub Actions থেকে চলে। RSS ফিড থেকে নতুন খবর নিয়ে
 // DeepSeek দিয়ে নিজের ভাষায় নতুন করে লিখে Firestore-এ সরাসরি প্রকাশ করে।
+// নিয়ম: প্রতিটি খবরে আলাদা API call; মিনিটে সর্বোচ্চ ১০ call;
+// 429 (রেট লিমিট) এলে অপেক্ষা করে আবার চেষ্টা; লেখার দৈর্ঘ্য সীমিত।
 // কোনো খবর হুবহু কপি করা হয় না; প্রতিটি খবরে মূল সূত্রের নাম ও লিংক থাকে।
 // চালাতে env লাগে: DEEPSEEK_API_KEY, FIREBASE_SERVICE_ACCOUNT (JSON string)
 
@@ -66,37 +68,60 @@ function slugify(title, link) {
   return `${base}-${sha256(link).slice(0, 6)}`
 }
 
+// প্রতিটি খবরের জন্য আলাদা একটা API call — এক call-এ একাধিক খবর পাঠানো হয় না।
+// মিনিটে সর্বোচ্চ ১০টা call (call-এর মাঝে কমপক্ষে ৬ সেকেন্ড বিরতি)।
+const MIN_CALL_GAP_MS = 6000
+let lastCallStart = 0
+
 async function rewriteWithDeepSeek(item, sourceName) {
-  const res = await fetch('https://api.deepseek.com/chat/completions', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}`,
-    },
-    body: JSON.stringify({
-      model: 'deepseek-chat',
-      temperature: 0.3,
-      response_format: { type: 'json_object' },
-      messages: [
-        {
-          role: 'system',
-          content: 'তুমি একজন বাংলা সংবাদ লেখক। দেওয়া খবরের তথ্য থেকে নিজের ভাষায় সম্পূর্ণ নতুন করে বাংলা খবর লিখবে। মূল খবরের বাক্য হুবহু কপি করবে না। নাম, সংখ্যা, তারিখ ও তথ্য ঠিক রাখবে; কোনো তথ্য বানাবে না। শুধু JSON দেবে।',
-        },
-        {
-          role: 'user',
-          content: `উৎস: ${sourceName}\nমূল শিরোনাম: ${item.title}\nমূল লিংক: ${item.link}\nবিবরণ: ${item.desc.slice(0, 3000)}\n\nএই JSON আকারে লেখো: {"title": "সংক্ষিপ্ত শিরোনাম", "summary": "১-২ বাক্যের সংক্ষেপ", "body": ["অনুচ্ছেদ ১", "অনুচ্ছেদ ২", "অনুচ্ছেদ ৩"], "category": "এই ৯টির একটি: jatiyo, rajniti, khela, binodon, antorjatik, orthoniti, shikkha, dhormo, projukti", "breaking": true/false (শুধু খুব গুরুত্বপূর্ণ জরুরি খবর হলে true)}। body-তে ৩-৫টি ছোট অনুচ্ছেদ থাকবে।`,
-        },
-      ],
-    }),
-  })
-  if (!res.ok) throw new Error(`DeepSeek ${res.status}: ${(await res.text()).slice(0, 200)}`)
-  const data = await res.json()
-  const out = JSON.parse(data.choices[0].message.content)
-  if (!out.title || !out.summary || !Array.isArray(out.body) || !out.body.length) {
-    throw new Error('DeepSeek থেকে অসম্পূর্ণ লেখা এসেছে')
+  // 429 (রেট লিমিট) এলে অপেক্ষা করে আবার চেষ্টা করা হবে।
+  const retryWaits = [30000, 60000]
+  for (let attempt = 0; ; attempt++) {
+    const gap = Date.now() - lastCallStart
+    if (gap < MIN_CALL_GAP_MS) await sleep(MIN_CALL_GAP_MS - gap)
+    lastCallStart = Date.now()
+    const res = await fetch('https://api.deepseek.com/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: 'deepseek-chat',
+        temperature: 0.3,
+        max_tokens: 1200,
+        response_format: { type: 'json_object' },
+        messages: [
+          {
+            role: 'system',
+            content: 'তুমি একজন বাংলা সংবাদ লেখক। দেওয়া খবরের তথ্য থেকে নিজের ভাষায় সম্পূর্ণ নতুন করে বাংলা খবর লিখবে। মূল খবরের বাক্য হুবহু কপি করবে না। নাম, সংখ্যা, তারিখ ও তথ্য ঠিক রাখবে; কোনো তথ্য বানাবে না। শুধু JSON দেবে।',
+          },
+          {
+            role: 'user',
+            content: `উৎস: ${sourceName}\nমূল শিরোনাম: ${item.title}\nমূল লিংক: ${item.link}\nবিবরণ: ${item.desc.slice(0, 3000)}\n\nএই JSON আকারে লেখো: {"title": "সংক্ষিপ্ত শিরোনাম", "summary": "১-২ বাক্যের সংক্ষেপ", "body": ["অনুচ্ছেদ ১", "অনুচ্ছেদ ২", "অনুচ্ছেদ ৩"], "category": "এই ৯টির একটি: jatiyo, rajniti, khela, binodon, antorjatik, orthoniti, shikkha, dhormo, projukti", "breaking": true/false (শুধু খুব গুরুত্বপূর্ণ জরুরি খবর হলে true)}। body-তে ৩-৪টি ছোট অনুচ্ছেদ থাকবে।`,
+          },
+        ],
+      }),
+    })
+    if (res.status === 429 && attempt < retryWaits.length) {
+      const wait = retryWaits[attempt]
+      console.log(`  রেট লিমিট (429) — ${wait / 1000} সেকেন্ড অপেক্ষা করে আবার চেষ্টা করছি`)
+      await sleep(wait)
+      continue
+    }
+    if (!res.ok) throw new Error(`DeepSeek ${res.status}: ${(await res.text()).slice(0, 200)}`)
+    const data = await res.json()
+    const out = JSON.parse(data.choices[0].message.content)
+    if (!out.title || !out.summary || !Array.isArray(out.body) || !out.body.length) {
+      throw new Error('DeepSeek থেকে অসম্পূর্ণ লেখা এসেছে')
+    }
+    if (!CATEGORIES.includes(out.category)) out.category = 'jatiyo'
+    // দৈর্ঘ্য সীমিত রাখা: শিরোনাম ১২০, সংক্ষেপ ২৫০, body সর্বোচ্চ ৪ অনুচ্ছেদ × ৬০০ অক্ষর।
+    out.title = String(out.title).slice(0, 120)
+    out.summary = String(out.summary).slice(0, 250)
+    out.body = out.body.slice(0, 4).map((p) => String(p).slice(0, 600))
+    return out
   }
-  if (!CATEGORIES.includes(out.category)) out.category = 'jatiyo'
-  return out
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
